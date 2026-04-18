@@ -73,6 +73,12 @@ export const REDEEM_DELAY_AFTER_CLOSE   = 320;  // poll for resolution starting 
 export const BOOK_POLL_MS               = 1_500;  // fallback REST polling interval
 export const LOG_LEVEL                  = optional('LOG_LEVEL', 'info');
 
+// ── Trading mode ────────────────────────────────────────────────────────────
+// Which bot `npm start` should launch:
+//   'arb'  → BTC Up/Down 9-rule arb strategy  (src/index.js → trader.js)
+//   'copy' → BUY-only copy trading bot        (src/copy/index.js)
+export const TRADING_MODE               = optional('TRADING_MODE', 'arb').toLowerCase();
+
 // ── EIP-712 domain for CLOB order signing (NegRisk exchange) ─────────────────
 export const ORDER_DOMAIN = {
   name: 'Polymarket CTF Exchange',

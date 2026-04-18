@@ -23,6 +23,7 @@ import {
   API_PASSPHRASE,
   MAX_LOSS_PER_HOUR_USDC,
   MARKET_WINDOW_SECONDS,
+  TRADING_MODE,
 } from './config.js';
 import logger from './logger.js';
 import { ClobClient }                 from './clob.js';
@@ -133,7 +134,25 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  logger.error('Fatal error in main()', { err: err.message, stack: err.stack });
+// ── Dispatcher ───────────────────────────────────────────────────────────────
+// TRADING_MODE picks which bot this entry point runs:
+//   'arb'  → the 9-rule BTC Up/Down strategy above  (default)
+//   'copy' → BUY-only copy trader in src/copy/index.js
+async function dispatch() {
+  if (TRADING_MODE === 'copy') {
+    logger.info('Dispatcher: TRADING_MODE=copy → loading copy trader…');
+    await import('./copy/index.js'); // runs its own main() at module load
+    return;
+  }
+  if (TRADING_MODE === 'arb') {
+    logger.info('Dispatcher: TRADING_MODE=arb → running 9-rule strategy');
+    return main();
+  }
+  logger.error(`Dispatcher: unknown TRADING_MODE='${TRADING_MODE}'. Expected 'arb' or 'copy'.`);
+  process.exit(1);
+}
+
+dispatch().catch((err) => {
+  logger.error('Fatal error in dispatcher', { err: err.message, stack: err.stack });
   process.exit(1);
 });
