@@ -19,34 +19,83 @@ import { ethers } from 'ethers';
 import {
   CLOB_API_URL,
   CLOB_WS_URL,
+  GAMMA_API_URL,
   PROXY_WALLET,
   ORDER_DOMAIN,
+  ORDER_DOMAIN_BINARY,
   ORDER_TYPES,
   AUTH_DOMAIN,
   AUTH_TYPES,
   USDC_SCALE,
   TOKEN_DECIMALS,
+  SIGNATURE_TYPE,
 } from './config.js';
 import logger from './logger.js';
 
-// ── Side / SignatureType constants ────────────────────────────────────────────
-const SIDE_BUY  = 0;
-const SIDE_SELL = 1;
-const SIG_TYPE_EOA   = 0; // standard EOA (personal_sign / typed data)
-const SIG_TYPE_PROXY = 2; // Polymarket proxy wallet
+// ── Side constants (must be the string "BUY"/"SELL", not integers) ────────────
+const SIDE_BUY  = 'BUY';
+const SIDE_SELL = 'SELL';
+
+const ROUNDING_CONFIG = {
+  '0.1':    { price: 1, size: 2, amount: 3 },
+  '0.01':   { price: 2, size: 2, amount: 4 },
+  '0.001':  { price: 3, size: 2, amount: 5 },
+  '0.0001': { price: 4, size: 2, amount: 6 },
+};
+
+function roundDown(x, digits) {
+  const f = 10 ** digits;
+  return Math.floor(x * f) / f;
+}
+
+function roundUp(x, digits) {
+  const f = 10 ** digits;
+  return Math.ceil(x * f) / f;
+}
+
+function roundNormal(x, digits) {
+  const f = 10 ** digits;
+  return Math.round(x * f) / f;
+}
+
+function decimalPlaces(x) {
+  const s = x.toString();
+  if (s.includes('e-')) {
+    const [, exp] = s.split('e-');
+    return parseInt(exp, 10);
+  }
+  const parts = s.split('.');
+  return parts[1]?.length ?? 0;
+}
+
+function toTokenDecimals(x) {
+  const scaled = x * USDC_SCALE;
+  return BigInt(Math.round(scaled)).toString();
+}
+
+function getRoundConfig(tickSize) {
+  return ROUNDING_CONFIG[String(tickSize)] ?? ROUNDING_CONFIG['0.01'];
+}
 
 // ── HMAC auth headers (for all trading endpoints) ────────────────────────────
 function buildHeaders(method, path, body = '') {
   if (!ClobClient._creds) throw new Error('CLOB credentials not initialised — call ClobClient.init() first');
+  if (!ClobClient._signerAddress) throw new Error('CLOB signer address not initialised — call ClobClient.init() first');
   const { apiKey, secret, passphrase } = ClobClient._creds;
   const ts  = Math.floor(Date.now() / 1000).toString();
   const msg = ts + method.toUpperCase() + path + body;
-  const sig = crypto.createHmac('sha256', secret).update(msg).digest('base64');
+  // Decode the base64 secret to raw bytes (as the official SDK does),
+  // then encode the HMAC output as URL-safe base64.
+  const secretBytes = Buffer.from(secret.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  const rawSig = crypto.createHmac('sha256', secretBytes).update(msg).digest('base64');
+  const sig = rawSig.replace(/\+/g, '-').replace(/\//g, '_');
   return {
-    'POLY_ADDRESS':    PROXY_WALLET,
+    // Polymarket L2 auth requires the EOA signer address tied to the API key,
+    // not the proxy wallet / funder address.
+    'POLY_ADDRESS':    ClobClient._signerAddress,
     'POLY_SIGNATURE':  sig,
     'POLY_TIMESTAMP':  ts,
-    'POLY_NONCE':      '',
+    'POLY_NONCE':      '0',
     'POLY_API_KEY':    apiKey,
     'POLY_PASSPHRASE': passphrase,
     'Content-Type':    'application/json',
@@ -69,6 +118,22 @@ async function restCall(method, path, data = null, auth = true) {
   } catch (err) {
     const status = err.response?.status;
     const detail = err.response?.data;
+    if (
+      auth &&
+      status === 401 &&
+      !config._retriedAfterRefresh &&
+      /invalid api key/i.test(detail?.error ?? '')
+    ) {
+      logger.warn('CLOB: cached API credentials rejected, deriving fresh credentials and retrying');
+      await ClobClient.refreshCredentials();
+      const retryConfig = {
+        ...config,
+        headers: buildHeaders(method, path, body),
+        _retriedAfterRefresh: true,
+      };
+      const retryRes = await axios(retryConfig);
+      return retryRes.data;
+    }
     logger.error('CLOB REST error', { method, path, status, detail });
     throw err;
   }
@@ -78,21 +143,34 @@ async function restCall(method, path, data = null, auth = true) {
 /**
  * Build and sign a BUY limit order struct.
  *
- * @param {ethers.Wallet} wallet   - Signer wallet
- * @param {string}        tokenId  - ERC-1155 token ID (as a decimal string)
- * @param {number}        price    - e.g. 0.50  (human units, 0–1)
- * @param {number}        shares   - e.g. 100   (human units)
- * @param {number}        expiry   - unix ts (0 = GTC, i.e. good-till-cancel within market)
+ * @param {ethers.Wallet} wallet    - Signer wallet (EOA)
+ * @param {string}        tokenId   - ERC-1155 token ID (as a decimal string)
+ * @param {number}        price     - e.g. 0.50  (human units, 0–1)
+ * @param {number}        shares    - e.g. 100   (human units)
+ * @param {number}        expiry    - unix ts (0 = GTC)
+ * @param {boolean}       negRisk   - true  → Neg Risk CTF Exchange (complementary-token markets)
+ *                                    false → standard CTF Exchange (binary YES/NO markets)
  * @returns {{ orderData, signature }}
  */
-async function buildBuyOrder(wallet, tokenId, price, shares, expiry = 0) {
-  // Convert to on-chain units (6 decimals) as BigInt strings.
-  const makerAmt = BigInt(Math.round(price * shares * USDC_SCALE)).toString();
-  const takerAmt = BigInt(Math.round(shares * USDC_SCALE)).toString();
-  const salt     = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)).toString();
+async function buildLimitBuyOrder(wallet, tokenId, price, shares, expiry = 0, negRisk = true, feeRateBps = '0', tickSize = '0.01') {
+  const roundConfig = getRoundConfig(tickSize);
+  const rawPrice = roundNormal(price, roundConfig.price);
+  const rawTakerAmt = roundDown(shares, roundConfig.size);
 
-  const orderData = {
-    salt:          salt,
+  let rawMakerAmt = rawTakerAmt * rawPrice;
+  if (decimalPlaces(rawMakerAmt) > roundConfig.amount) {
+    rawMakerAmt = roundUp(rawMakerAmt, roundConfig.amount + 4);
+    if (decimalPlaces(rawMakerAmt) > roundConfig.amount) {
+      rawMakerAmt = roundDown(rawMakerAmt, roundConfig.amount);
+    }
+  }
+
+  const makerAmt = toTokenDecimals(rawMakerAmt);
+  const takerAmt = toTokenDecimals(rawTakerAmt);
+  const saltInt  = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+
+  const signData = {
+    salt:          saltInt,
     maker:         PROXY_WALLET,
     signer:        wallet.address,
     taker:         ethers.ZeroAddress,
@@ -101,33 +179,107 @@ async function buildBuyOrder(wallet, tokenId, price, shares, expiry = 0) {
     takerAmount:   takerAmt,
     expiration:    expiry.toString(),
     nonce:         '0',
-    feeRateBps:    '0',
-    side:          SIDE_BUY,
-    signatureType: SIG_TYPE_EOA,
+    feeRateBps:    feeRateBps.toString(),
+    side:          0,
+    signatureType: SIGNATURE_TYPE,
   };
 
-  const signature = await wallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderData);
+  const domain = negRisk ? ORDER_DOMAIN : ORDER_DOMAIN_BINARY;
+  const signature = await wallet.signTypedData(domain, ORDER_TYPES, signData);
+
+  const orderData = {
+    ...signData,
+    side: SIDE_BUY,
+    salt: saltInt,
+  };
+
+  return { orderData, signature };
+}
+
+async function buildMarketBuyOrder(wallet, tokenId, maxPrice, amountUsdc, expiry = 0, negRisk = true, feeRateBps = '0', tickSize = '0.01') {
+  const roundConfig = getRoundConfig(tickSize);
+  const rawPrice = roundDown(maxPrice, roundConfig.price);
+  const rawMakerAmt = roundDown(amountUsdc, roundConfig.size);
+
+  let rawTakerAmt = rawMakerAmt / rawPrice;
+  if (decimalPlaces(rawTakerAmt) > roundConfig.amount) {
+    rawTakerAmt = roundUp(rawTakerAmt, roundConfig.amount + 4);
+    if (decimalPlaces(rawTakerAmt) > roundConfig.amount) {
+      rawTakerAmt = roundDown(rawTakerAmt, roundConfig.amount);
+    }
+  }
+
+  const makerAmt = toTokenDecimals(rawMakerAmt);
+  const takerAmt = toTokenDecimals(rawTakerAmt);
+  const saltInt  = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+
+  const signData = {
+    salt:          saltInt,
+    maker:         PROXY_WALLET,
+    signer:        wallet.address,
+    taker:         ethers.ZeroAddress,
+    tokenId:       tokenId,
+    makerAmount:   makerAmt,
+    takerAmount:   takerAmt,
+    expiration:    expiry.toString(),
+    nonce:         '0',
+    feeRateBps:    feeRateBps.toString(),
+    side:          0,
+    signatureType: SIGNATURE_TYPE,
+  };
+
+  const domain = negRisk ? ORDER_DOMAIN : ORDER_DOMAIN_BINARY;
+  const signature = await wallet.signTypedData(domain, ORDER_TYPES, signData);
+
+  const orderData = {
+    ...signData,
+    side: SIDE_BUY,
+    salt: saltInt,
+  };
+
   return { orderData, signature };
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 export class ClobClient {
   static _creds = null;
+  static _signerAddress = null;
+  static _wallet = null;
+  static _takerFeeCache = new Map();
 
   /**
    * Initialise the client.
-   * If apiKey/secret/passphrase are provided (from .env) they are used directly.
-   * Otherwise a fresh L1 auth round-trip derives them from the wallet.
+   * Prefer Polymarket's documented L1 -> L2 auth flow and derive credentials
+   * from the signer on startup. If derivation fails and explicit credentials
+   * were provided, fall back to those as a last resort.
    */
   static async init(wallet, { apiKey, secret, passphrase } = {}) {
-    if (apiKey && secret && passphrase) {
-      ClobClient._creds = { apiKey, secret, passphrase };
-      logger.info('CLOB: using cached API credentials');
+    ClobClient._wallet = wallet;
+    ClobClient._signerAddress = wallet.address;
+    try {
+      logger.info('CLOB: deriving API credentials via L1 auth…');
+      ClobClient._creds = await ClobClient._deriveCredentials(wallet);
+      logger.info('CLOB: credentials derived', { apiKey: ClobClient._creds.apiKey });
       return;
+    } catch (err) {
+      if (apiKey && secret && passphrase) {
+        ClobClient._creds = { apiKey, secret, passphrase };
+        logger.warn('CLOB: credential derivation failed, falling back to provided credentials', {
+          err: err.message,
+        });
+        return;
+      }
+      throw err;
     }
-    logger.info('CLOB: deriving API credentials via L1 auth…');
-    ClobClient._creds = await ClobClient._deriveCredentials(wallet);
-    logger.info('CLOB: credentials derived', { apiKey: ClobClient._creds.apiKey });
+  }
+
+  static async refreshCredentials() {
+    if (!ClobClient._wallet) {
+      throw new Error('CLOB wallet not initialised — cannot refresh API credentials');
+    }
+    ClobClient._creds = await ClobClient._deriveCredentials(ClobClient._wallet);
+    logger.info('CLOB: refreshed API credentials', { apiKey: ClobClient._creds.apiKey });
+    return ClobClient._creds;
   }
 
   /** L1 auth: sign an EIP-712 auth message and POST to /auth/api-key */
@@ -143,15 +295,28 @@ export class ClobClient {
     const sig = await wallet.signTypedData(AUTH_DOMAIN, AUTH_TYPES, authMsg);
 
     const headers = {
-      'POLY_ADDRESS':   PROXY_WALLET,
+      // L1 auth also requires the EOA signer address, not the proxy wallet.
+      'POLY_ADDRESS':   wallet.address,
       'POLY_SIGNATURE': sig,
       'POLY_TIMESTAMP': ts,
       'POLY_NONCE':     nonce.toString(),
       'Content-Type':   'application/json',
     };
-    const res = await axios.post(`${CLOB_API_URL}/auth/api-key`, {}, { headers });
-    const { apiKey, secret, passphrase } = res.data;
-    return { apiKey, secret, passphrase };
+    // Prefer deriving an existing key for nonce=0. Creating a new key fails
+    // for wallets that already have credentials, which is the common case.
+    try {
+      const res = await axios.get(`${CLOB_API_URL}/auth/derive-api-key`, { headers });
+      const { apiKey, secret, passphrase } = res.data;
+      return { apiKey, secret, passphrase };
+    } catch (err) {
+      logger.warn('CLOB: derive-api-key failed, trying create-api-key', {
+        status: err.response?.status,
+        detail: err.response?.data,
+      });
+      const res = await axios.post(`${CLOB_API_URL}/auth/api-key`, {}, { headers });
+      const { apiKey, secret, passphrase } = res.data;
+      return { apiKey, secret, passphrase };
+    }
   }
 
   /** Returns current API credentials (for WS auth). */
@@ -159,62 +324,138 @@ export class ClobClient {
     return ClobClient._creds;
   }
 
+  static async getTakerFeeBps(tokenId) {
+    const cached = ClobClient._takerFeeCache.get(tokenId);
+    if (cached !== undefined) return cached;
+
+    const res = await axios.get(`${GAMMA_API_URL}/markets?clob_token_ids=${tokenId}`, {
+      timeout: 10_000,
+    });
+    const market = res.data?.[0];
+    const fee = String(market?.takerBaseFee ?? 0);
+    ClobClient._takerFeeCache.set(tokenId, fee);
+    return fee;
+  }
+
   // ── Order book ──────────────────────────────────────────────────────────────
 
   /**
    * Fetch full order book for a token.
-   * Returns { bids: [{price,size}], asks: [{price,size}] } (human-readable floats).
+   * Returns:
+   *   { bids, asks, tickSize, minOrderSize }
+   *
+   * tickSize    – minimum price increment (e.g. 0.01). Prices MUST conform or
+   *               the CLOB rejects the order with INVALID_ORDER_MIN_TICK_SIZE.
+   * minOrderSize – minimum order size in USDC (typically 5).
    */
   static async getBook(tokenId) {
     const raw = await restCall('GET', `/book?token_id=${tokenId}`, null, false);
     return {
-      bids: (raw.bids ?? []).map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) })),
-      asks: (raw.asks ?? []).map(a => ({ price: parseFloat(a.price), size: parseFloat(a.size) })),
+      bids:         (raw.bids ?? []).map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) })),
+      asks:         (raw.asks ?? []).map(a => ({ price: parseFloat(a.price), size: parseFloat(a.size) })),
+      tickSize:     parseFloat(raw.tick_size    ?? '0.01'),
+      minOrderSize: parseFloat(raw.min_order_size ?? '5'),
     };
   }
 
-  /** Returns the best ask { price, size } for a token, or null if no liquidity. */
+  /**
+   * Returns the best ask AND the market's tick size for a token.
+   * { price, size, tickSize, minOrderSize } or null if no liquidity.
+   */
   static async getBestAsk(tokenId) {
     const book = await ClobClient.getBook(tokenId);
-    if (!book.asks.length) return null;
-    return book.asks.reduce((a, b) => (a.price <= b.price ? a : b));
+    const best = book.asks.length
+      ? book.asks.reduce((a, b) => (a.price <= b.price ? a : b))
+      : null;
+    if (!best) return null;
+    return { ...best, tickSize: book.tickSize, minOrderSize: book.minOrderSize };
   }
 
   // ── Order management ────────────────────────────────────────────────────────
 
   /**
    * Post a GTC limit BUY order to the CLOB.
+   * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
    * Returns the orderId string, or throws on rejection.
    */
-  static async postLimitBuy(wallet, tokenId, price, shares) {
-    const { orderData, signature } = await buildBuyOrder(wallet, tokenId, price, shares);
+  static async postLimitBuy(wallet, tokenId, price, shares, negRisk = true) {
+    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
+    const { tickSize } = await ClobClient.getBook(tokenId);
+    const { orderData, signature } = await buildLimitBuyOrder(
+      wallet, tokenId, price, shares, 0, negRisk, feeRateBps, tickSize,
+    );
     const body = {
       order: { ...orderData, signature },
-      owner:     PROXY_WALLET,
+      owner:     ClobClient._creds.apiKey,  // API key UUID, not proxy wallet
       orderType: 'GTC',
     };
     const path = '/order';
     const res  = await restCall('POST', path, body);
-    if (!res.success) throw new Error(`Order rejected: ${JSON.stringify(res)}`);
+    if (!res.success) throw new Error(`Order rejected: ${res.errorMsg ?? JSON.stringify(res)}`);
     logger.debug('CLOB: limit buy posted', { tokenId, price, shares, orderId: res.orderId });
     return res.orderId;
   }
 
   /**
-   * Post an IOC (immediate-or-cancel) BUY order — used for the taker arb leg.
-   * The order will fill up to `shares` at the given maxPrice, and any remainder
-   * is cancelled immediately by the matching engine.
+   * Post a FAK (Fill-And-Kill) BUY order.
+   *
+   * FAK is the correct "IOC" type on Polymarket:
+   *   – Fills as many shares as available immediately at or below maxPrice.
+   *   – Any unfilled remainder is cancelled (never rests on the book).
+   *
+   * Use this for copy-trade buys and any taker order where a partial fill
+   * is acceptable.
+   *
+   * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
    */
-  static async postIOCBuy(wallet, tokenId, maxPrice, shares) {
-    const { orderData, signature } = await buildBuyOrder(wallet, tokenId, maxPrice, shares);
+  static async postIOCBuy(wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
+    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
+    const { tickSize } = await ClobClient.getBook(tokenId);
+    const { orderData, signature } = await buildMarketBuyOrder(
+      wallet, tokenId, maxPrice, amountUsdc, 0, negRisk, feeRateBps, tickSize,
+    );
     const body = {
       order: { ...orderData, signature },
-      owner:     PROXY_WALLET,
-      orderType: 'FOK', // Fill-or-Kill; use FOK/IOC depending on CLOB version
+      owner:     ClobClient._creds.apiKey,  // API key UUID, not proxy wallet
+      orderType: 'FAK',
     };
     const path = '/order';
     const res  = await restCall('POST', path, body);
-    logger.debug('CLOB: IOC buy posted', { tokenId, maxPrice, shares, res });
+    if (res.success === false) {
+      logger.warn('CLOB: FAK buy rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
+    } else {
+      logger.debug('CLOB: FAK buy posted', { tokenId, maxPrice, amountUsdc, status: res.status });
+    }
+    return res;
+  }
+
+  /**
+   * Post a FOK (Fill-Or-Kill) BUY order.
+   *
+   * The entire order must fill immediately and completely, or the whole
+   * thing is cancelled. Use this when an all-or-nothing fill is required
+   * (e.g. arb bot needs both legs to fill equally to stay delta-neutral).
+   *
+   * @param {boolean} negRisk - true for Neg Risk markets, false for standard binary markets
+   */
+  static async postFOKBuy(wallet, tokenId, maxPrice, amountUsdc, negRisk = true) {
+    const feeRateBps = await ClobClient.getTakerFeeBps(tokenId);
+    const { tickSize } = await ClobClient.getBook(tokenId);
+    const { orderData, signature } = await buildMarketBuyOrder(
+      wallet, tokenId, maxPrice, amountUsdc, 0, negRisk, feeRateBps, tickSize,
+    );
+    const body = {
+      order: { ...orderData, signature },
+      owner:     ClobClient._creds.apiKey,  // API key UUID, not proxy wallet
+      orderType: 'FOK',
+    };
+    const path = '/order';
+    const res  = await restCall('POST', path, body);
+    if (res.success === false) {
+      logger.warn('CLOB: FOK buy rejected', { tokenId, errorMsg: res.errorMsg, status: res.status });
+    } else {
+      logger.debug('CLOB: FOK buy posted', { tokenId, maxPrice, amountUsdc, status: res.status });
+    }
     return res;
   }
 
@@ -301,8 +542,9 @@ export class BookFeed extends EventEmitter {
     ws.on('open', () => {
       logger.debug('BookFeed: WS connected, subscribing', { tokenIds: this.tokenIds });
       ws.send(JSON.stringify({
-        type:      'market',
-        assets_ids: this.tokenIds,
+        type:                   'market',
+        assets_ids:             this.tokenIds,
+        custom_feature_enabled: true, // enables best_bid_ask, new_market, market_resolved events
       }));
       this._reconnectDelay = 1000; // reset backoff on successful connect
     });
@@ -365,6 +607,20 @@ export class BookFeed extends EventEmitter {
         } else if (!cur || price < cur.price || (Math.abs(price - cur.price) < 1e-9 && size !== cur.size)) {
           this.bestAsks[asset_id] = { price, size };
           this.emit('update', { tokenId: asset_id, bestAsk: { price, size } });
+        }
+      }
+      return;
+    }
+
+    if (event_type === 'best_bid_ask') {
+      // Fast top-of-book update (requires custom_feature_enabled: true).
+      // Update best ask directly without re-parsing the full price_change diff.
+      const bestAsk = parseFloat(msg.best_ask);
+      if (!isNaN(bestAsk) && bestAsk > 0) {
+        const cur = this.bestAsks[asset_id];
+        if (!cur || Math.abs(cur.price - bestAsk) > 1e-9) {
+          this.bestAsks[asset_id] = { price: bestAsk, size: cur?.size ?? 0 };
+          this.emit('update', { tokenId: asset_id, bestAsk: this.bestAsks[asset_id] });
         }
       }
       return;

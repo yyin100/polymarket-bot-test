@@ -22,7 +22,16 @@ function parseFloat_(key, fallback) {
 
 // ── Wallet ───────────────────────────────────────────────────────────────────
 export const PRIVATE_KEY    = required('PRIVATE_KEY');
-export const PROXY_WALLET   = required('PROXY_WALLET').toLowerCase();
+export const PROXY_WALLET   = required('PROXY_WALLET'); // Keep EIP-55 checksum as-is
+export const TARGET_WALLET  = optional('TARGET_WALLET', '').toLowerCase();
+
+// Signature type for EIP-712 order signing.
+//  0 = EOA          – standalone wallet, signer IS the funder (rare)
+//  1 = POLY_PROXY   – Magic Link / email login
+//  2 = GNOSIS_SAFE  – browser wallet (MetaMask, Rabby) proxy wallet (most common)
+// Most Polymarket accounts use a proxy wallet → default 2.
+// See: https://docs.polymarket.com/trading/overview#signature-types
+export const SIGNATURE_TYPE = parseFloat_('SIGNATURE_TYPE', 2);
 
 // ── API credentials (optional on first run; auth.js generates them) ─────────
 export const API_KEY        = optional('POLY_API_KEY', '');
@@ -42,12 +51,14 @@ export const CLOB_WS_URL    = 'wss://ws-subscriptions-clob.polymarket.com/ws/';
 // ── Polygon contract addresses ───────────────────────────────────────────────
 export const USDC_ADDRESS                = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e (bridged)
 export const CTF_ADDRESS                 = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045'; // ConditionalTokens
-export const NEG_RISK_ADAPTER_ADDRESS    = '0xd91E80cF2C1f8038c75B4F93FD9c28C4aa01B6f8';
+export const NEG_RISK_ADAPTER_ADDRESS    = '0xD91e80cf2C1f8038c75b4f93Fd9c28C4aa01B6F8';
 export const NEG_RISK_CTF_EXCHANGE       = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
 export const CTF_EXCHANGE_ADDRESS        = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 
 // ── Risk parameters ──────────────────────────────────────────────────────────
 export const MAX_SPEND_PER_MARKET        = parseFloat_('MAX_SPEND_PER_MARKET', 400);
+export const COPY_TRADE_BUY_PERCENT      = parseFloat_('COPY_TRADE_BUY_PERCENT', 100);
+export const COPY_TRADE_POLL_MS          = parseFloat_('COPY_TRADE_POLL_MS', 2_000);
 export const MAX_INVENTORY_IMBALANCE     = parseFloat_('MAX_INVENTORY_IMBALANCE_USDC', 200);
 export const TARGET_EDGE                 = parseFloat_('TARGET_EDGE', 0.02);
 export const MERGE_THRESHOLD_USDC        = parseFloat_('MERGE_THRESHOLD_USDC', 15);
@@ -73,18 +84,27 @@ export const REDEEM_DELAY_AFTER_CLOSE   = 320;  // poll for resolution starting 
 export const BOOK_POLL_MS               = 1_500;  // fallback REST polling interval
 export const LOG_LEVEL                  = optional('LOG_LEVEL', 'info');
 
-// ── Trading mode ────────────────────────────────────────────────────────────
-// Which bot `npm start` should launch:
-//   'arb'  → BTC Up/Down 9-rule arb strategy  (src/index.js → trader.js)
-//   'copy' → BUY-only copy trading bot        (src/copy/index.js)
-export const TRADING_MODE               = optional('TRADING_MODE', 'arb').toLowerCase();
-
-// ── EIP-712 domain for CLOB order signing (NegRisk exchange) ─────────────────
+// ── EIP-712 domains for CLOB order signing ───────────────────────────────────
+// Polymarket has TWO exchange contracts. Orders MUST be signed against the
+// correct one or they will be rejected on-chain.
+//
+//  ORDER_DOMAIN        – Neg Risk CTF Exchange (complementary-token / multi-outcome markets)
+//                        e.g. btc-updown-5m, election candidates
+//  ORDER_DOMAIN_BINARY – Standard CTF Exchange (simple binary YES/NO markets)
+//
+// Use the `negativeRisk` field on the market/position to pick the right domain.
 export const ORDER_DOMAIN = {
   name: 'Polymarket CTF Exchange',
   version: '1',
   chainId: CHAIN_ID,
   verifyingContract: NEG_RISK_CTF_EXCHANGE,
+};
+
+export const ORDER_DOMAIN_BINARY = {
+  name: 'Polymarket CTF Exchange',
+  version: '1',
+  chainId: CHAIN_ID,
+  verifyingContract: CTF_EXCHANGE_ADDRESS,
 };
 
 export const ORDER_TYPES = {
@@ -115,7 +135,7 @@ export const AUTH_TYPES = {
   ClobAuth: [
     { name: 'address',   type: 'address' },
     { name: 'timestamp', type: 'string'  },
-    { name: 'nonce',     type: 'int256'  },
+    { name: 'nonce',     type: 'uint256' },
     { name: 'message',   type: 'string'  },
   ],
 };

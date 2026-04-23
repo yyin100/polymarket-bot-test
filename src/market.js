@@ -12,7 +12,7 @@
  *  - Poll until the market is resolved (for redeem timing).
  */
 import axios from 'axios';
-import { GAMMA_API_URL, MARKET_WINDOW_SECONDS } from './config.js';
+import { DATA_API_URL, GAMMA_API_URL, MARKET_WINDOW_SECONDS, TARGET_WALLET } from './config.js';
 import logger from './logger.js';
 
 // ── Slug & timestamp helpers ──────────────────────────────────────────────────
@@ -43,6 +43,10 @@ export function slugFor(ts) {
  */
 export function msUntil(unixTs) {
   return unixTs * 1000 - Date.now();
+}
+
+function normaliseWalletAddress(address) {
+  return typeof address === 'string' ? address.toLowerCase() : '';
 }
 
 // ── Gamma API ─────────────────────────────────────────────────────────────────
@@ -105,6 +109,73 @@ export async function fetchMarket(slug) {
     resolved:     !!(m.resolved ?? m.is_resolved),
     question:     m.question ?? m.title,
   };
+}
+
+/**
+ * Fetch detailed position data for a Polymarket proxy wallet from the Data API.
+ *
+ * Useful for copy-trade logic that needs to inspect the target wallet's live
+ * positions, sizing, average prices, and market metadata.
+ */
+export async function fetchWalletPositions(proxyWallet, {
+  sizeThreshold = 1,
+  limit = 100,
+  offset = 0,
+  sortBy = 'TOKENS',
+  sortDirection = 'DESC',
+} = {}) {
+  const wallet = normaliseWalletAddress(proxyWallet);
+  if (!wallet) throw new Error('fetchWalletPositions: proxyWallet is required');
+
+  const res = await axios.get(`${DATA_API_URL}/positions`, {
+    timeout: 10_000,
+    params: {
+      user: wallet,
+      sizeThreshold,
+      limit,
+      offset,
+      sortBy,
+      sortDirection,
+    },
+  });
+
+  return (res.data ?? []).map((position) => ({
+    proxyWallet: normaliseWalletAddress(position.proxyWallet ?? wallet),
+    asset: position.asset ?? '',
+    conditionId: position.conditionId ?? '',
+    size: Number(position.size ?? 0),
+    avgPrice: Number(position.avgPrice ?? 0),
+    initialValue: Number(position.initialValue ?? 0),
+    currentValue: Number(position.currentValue ?? 0),
+    cashPnl: Number(position.cashPnl ?? 0),
+    percentPnl: Number(position.percentPnl ?? 0),
+    totalBought: Number(position.totalBought ?? 0),
+    realizedPnl: Number(position.realizedPnl ?? 0),
+    percentRealizedPnl: Number(position.percentRealizedPnl ?? 0),
+    curPrice: Number(position.curPrice ?? 0),
+    redeemable: Boolean(position.redeemable),
+    mergeable: Boolean(position.mergeable),
+    title: position.title ?? '',
+    slug: position.slug ?? '',
+    icon: position.icon ?? '',
+    eventSlug: position.eventSlug ?? '',
+    outcome: position.outcome ?? '',
+    outcomeIndex: Number(position.outcomeIndex ?? 0),
+    oppositeOutcome: position.oppositeOutcome ?? '',
+    oppositeAsset: position.oppositeAsset ?? '',
+    endDate: position.endDate ?? '',
+    negativeRisk: Boolean(position.negativeRisk),
+  }));
+}
+
+/**
+ * Convenience wrapper for the configured copy-trade target wallet.
+ */
+export async function fetchTargetWalletPositions(options = {}) {
+  if (!TARGET_WALLET) {
+    throw new Error('TARGET_WALLET is not configured');
+  }
+  return fetchWalletPositions(TARGET_WALLET, options);
 }
 
 /**

@@ -227,10 +227,14 @@ export class Trader {
       shares:    maxShares.toFixed(2),
     });
 
-    // Fire both IOC legs as close to simultaneously as possible
+    // Fire both arb legs simultaneously.
+    // FOK (Fill-Or-Kill) ensures both legs either fill completely or cancel —
+    // avoiding a partial fill on one side that would create directional risk.
+    const upSpendUsdc = maxShares * upAsk.price;
+    const downSpendUsdc = maxShares * downAsk.price;
     const [upRes, downRes] = await Promise.allSettled([
-      ClobClient.postIOCBuy(this.wallet, upTokenId,   upAsk.price,   maxShares),
-      ClobClient.postIOCBuy(this.wallet, downTokenId, downAsk.price, maxShares),
+      ClobClient.postFOKBuy(this.wallet, upTokenId,   upAsk.price,   upSpendUsdc),
+      ClobClient.postFOKBuy(this.wallet, downTokenId, downAsk.price, downSpendUsdc),
     ]);
 
     // Estimate fills (actual fills come through FillFeed; this is a conservative estimate)
